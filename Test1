@@ -1,0 +1,416 @@
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+if type(env.__JD_UNLOAD) == "function" then pcall(env.__JD_UNLOAD) end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Stats = game:GetService("Stats")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then return end
+
+local GATE_NAME = "JaneDoe"
+local RANGE = 600
+local AIM_OFFSET = -0.3
+local SPEED, GRAVITY, PITCH_OFFSET = 250, 40, math.atan(1 / 3)
+local CHARGE_TIME, MAX_HOLD = 0.01, 1e9
+local HATCHET_RANGE, HATCHET_DUR = 28, 1.0
+local HATCHET_STEP = "__JD_HatchetAim"
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+
+local motion = setmetatable({}, { __mode = "k" })
+local connections = {}
+local cachedPing, lastPingAt = 0.05, 0
+local remote, origInvoke
+local crystalAbility, crystalOrig, actorsMod
+local hatchetUntil, hatchetBound, savedAutoRotate = 0, false, nil
+local unloaded = false
+
+local hookFn = (typeof(hookfunction) == "function" and hookfunction)
+	or (typeof(replaceclosure) == "function" and replaceclosure)
+
+local function isJaneDoe(char)
+	return char ~= nil and (char.Name == GATE_NAME or char:GetAttribute("CharacterName") == GATE_NAME)
+end
+
+local function localContext()
+	local char = LocalPlayer.Character
+	if not isJaneDoe(char) then return nil end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	return root, char
+end
+
+local function getSpawn(root)
+	local hum = root.Parent and root.Parent:FindFirstChildOfClass("Humanoid")
+	local hip = hum and hum.HipHeight or 1.35
+	return root.Position + Vector3.new(0, (hip + root.Size.Y * 0.5) * 0.5, 0)
+end
+
+local function getPing()
+	local now = os.clock()
+	if now - lastPingAt >= 0.25 then
+		lastPingAt = now
+		local ok, ms = pcall(function()
+			return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+		if ok and type(ms) == "number" and ms == ms then
+			cachedPing = math.clamp((ms / 1000) * 0.55, 0.02, 0.35)
+		end
+	end
+	return cachedPing
+end
+
+local function eachKiller(char, visit)
+	local pf = Workspace:FindFirstChild("Players")
+	local folder = pf and pf:FindFirstChild("Killers")
+	if not folder then return end
+	for _, model in ipairs(folder:GetChildren()) do
+		if model ~= char and model:IsA("Model") then
+			local root = model:FindFirstChild("HumanoidRootPart")
+			local hum = model:FindFirstChildOfClass("Humanoid")
+			if root and hum and hum.Health > 0 then
+				visit(root, hum, model)
+			end
+		end
+	end
+end
+
+local function sampleTarget(root, hum)
+	local pos = root.Position
+	local now = os.clock()
+	local state = hum:GetState()
+	local airborne = state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.Jumping
+	local asmVel = root.AssemblyLinearVelocity
+	local d = motion[root]
+
+	if not d then
+		motion[root] = { pos = pos, time = now, vel = asmVel, lastVel = asmVel, accel = Vector3.zero, conf = 1.0, airborne = airborne }
+		return
+	end
+
+	local dt = now - d.time
+	if dt < 0.02 then return end
+
+	local rawVel = ((pos - d.pos) / dt):Lerp(asmVel, 0.35)
+	local prevFlat = Vector3.new(d.vel.X, 0, d.vel.Z)
+	local newFlat = Vector3.new(rawVel.X, 0, rawVel.Z)
+
+	if prevFlat.Magnitude > 2 and newFlat.Magnitude > 2 then
+		local dot = prevFlat.Unit:Dot(newFlat.Unit)
+		if dot < 0.15 then
+			d.conf = math.min(d.conf, math.clamp((dot + 1) * 0.5, 0.25, 1))
+			d.accel = d.accel * 0.25
+		else
+			d.conf = math.min(1.0, d.conf + dt * 4.0)
+		end
+	else
+		d.conf = math.min(1.0, d.conf + dt * 4.0)
+	end
+
+	d.vel = d.vel:Lerp(rawVel, 0.35)
+
+	local rawAccel = (d.vel - d.lastVel) / dt
+	if rawAccel.Magnitude > 120 then rawAccel = rawAccel.Unit * 120 end
+	local w = airborne and 0.2 or 0.15
+	d.accel = d.accel:Lerp(Vector3.new(rawAccel.X * w, 0, rawAccel.Z * w), 0.28)
+
+	d.lastVel, d.pos, d.time, d.airborne = d.vel, pos, now, airborne
+end
+
+local function predictPos(root, leadTime, useOffset)
+	local t = math.clamp(leadTime, 0, 1.6)
+	local d = motion[root]
+	local base = root.Position + Vector3.new(0, useOffset and AIM_OFFSET or 0, 0)
+	local vel = d and d.vel or root.AssemblyLinearVelocity
+	local accel = d and d.accel or Vector3.zero
+	local conf = d and d.conf or 1.0
+	local airborne = d and d.airborne or false
+
+	local et = t * conf
+	local hx = vel.X * et + 0.5 * accel.X * et * et
+	local hz = vel.Z * et + 0.5 * accel.Z * et * et
+	local vy = airborne and (vel.Y * t - 0.5 * Workspace.Gravity * t * t) or (vel.Y * et)
+	local pred = base + Vector3.new(hx, vy, hz)
+
+	local moveVec = pred - base
+	if moveVec.Magnitude > 1.0 then
+		rayParams.FilterDescendantsInstances = { LocalPlayer.Character, root.Parent }
+		local hit = Workspace:Raycast(base, moveVec, rayParams)
+		if hit then pred = hit.Position - moveVec.Unit * 1.2 end
+	end
+
+	if pred.Y < base.Y - 3 then
+		rayParams.FilterDescendantsInstances = { LocalPlayer.Character, root.Parent }
+		local floor = Workspace:Raycast(base, Vector3.new(0, -60, 0), rayParams)
+		if floor then pred = Vector3.new(pred.X, math.max(pred.Y, floor.Position.Y + 2.2), pred.Z) end
+	end
+
+	return pred
+end
+
+local function solveBallistics(targetRoot, spawn)
+	local speedSq = SPEED * SPEED
+	local ping = getPing()
+	local t = (targetRoot.Position - spawn).Magnitude / SPEED
+	local aimPos, angle = targetRoot.Position, 0
+
+	for _ = 1, 6 do
+		aimPos = predictPos(targetRoot, t + ping, true)
+		local delta = aimPos - spawn
+		local dx = Vector3.new(delta.X, 0, delta.Z).Magnitude
+		local dy = delta.Y
+		local disc = speedSq * speedSq - GRAVITY * (GRAVITY * dx * dx + 2 * dy * speedSq)
+
+		if disc >= 0 and dx > 0.01 then
+			angle = math.atan2(speedSq - math.sqrt(disc), GRAVITY * dx)
+		else
+			angle = math.atan2(dy, math.max(dx, 0.01))
+		end
+
+		local newT = dx / (SPEED * math.max(math.cos(angle), 0.15))
+		if math.abs(newT - t) < 0.008 then break end
+		t = newT
+	end
+
+	return aimPos, angle
+end
+
+local function pickTarget(char, myRoot)
+	local cam = Workspace.CurrentCamera
+	if not cam then return nil end
+	local center = cam.ViewportSize * 0.5
+	local best, bestScore
+
+	eachKiller(char, function(root, _, model)
+		local dist = (root.Position - myRoot.Position).Magnitude
+		if dist > RANGE then return end
+		local scr, onScreen = cam:WorldToViewportPoint(root.Position)
+		local score = (onScreen and (Vector2.new(scr.X, scr.Y) - center).Magnitude or 10000) + dist * 0.5
+
+		rayParams.FilterDescendantsInstances = { char }
+		local hit = Workspace:Raycast(cam.CFrame.Position, root.Position - cam.CFrame.Position, rayParams)
+		if hit and not hit.Instance:IsDescendantOf(model) then score = score + 5000 end
+
+		if not bestScore or score < bestScore then best, bestScore = root, score end
+	end)
+
+	return best
+end
+
+local function answer(request)
+	local myRoot, char = localContext()
+	if not myRoot then return nil end
+	local target = pickTarget(char, myRoot)
+	if not target then return nil end
+
+	local spawn = getSpawn(myRoot)
+	local aimPos, angle = solveBallistics(target, spawn)
+	if request == "GetMousePosition" then return aimPos end
+
+	local cam = Workspace.CurrentCamera
+	if not cam then return nil end
+	local camPos = cam.CFrame.Position
+	local delta = aimPos - spawn
+	local flat = Vector3.new(delta.X, 0, delta.Z)
+	if flat.Magnitude < 0.01 then
+		return CFrame.new(camPos, camPos + Vector3.new(0, delta.Y >= 0 and 1 or -1, 0))
+	end
+	return CFrame.new(camPos, camPos + flat.Unit) * CFrame.Angles(angle - PITCH_OFFSET, 0, 0)
+end
+
+local function invokeHandler(request, ...)
+	if not unloaded and (request == "GetMousePosition" or request == "GetCameraCF") then
+		local ok, res = pcall(answer, request)
+		if ok and res ~= nil then return res end
+	end
+	if origInvoke then return origInvoke(request, ...) end
+end
+
+local function patchCrystal(cfg)
+	if type(cfg) ~= "table" then return end
+	cfg.MinChargeTime = CHARGE_TIME
+	cfg.MaxChargeTime = CHARGE_TIME
+	if cfg.ChannelTime ~= nil then cfg.ChannelTime = CHARGE_TIME end
+	if cfg.MaximumHoldTime ~= nil then cfg.MaximumHoldTime = MAX_HOLD end
+end
+
+local function hookCrystal()
+	if crystalOrig or not hookFn then return end
+	local assets = ReplicatedStorage:FindFirstChild("Assets")
+	local surv = assets and assets:FindFirstChild("Survivors")
+	local jd = surv and surv:FindFirstChild("JaneDoe")
+	local behMod = jd and jd:FindFirstChild("Behavior")
+	if not (behMod and behMod:IsA("ModuleScript")) then return end
+
+	local ok, beh = pcall(require, behMod)
+	local crystal = ok and type(beh) == "table" and beh.Abilities and beh.Abilities.Crystal
+	if not (type(crystal) == "table" and type(crystal.Callback) == "function") then return end
+
+	local okH, orig = pcall(function()
+		return hookFn(crystal.Callback, function(self, ctx, ...)
+			if not unloaded and type(self) == "table" then
+				if type(self.Config) == "table" then patchCrystal(self.Config.Crystal) end
+				if type(self.State) == "table" then self.State.CrystalFullChargeTime = nil end
+			end
+			return crystalOrig(self, ctx, ...)
+		end)
+	end)
+	if okH and type(orig) == "function" then crystalAbility, crystalOrig = crystal, orig end
+end
+
+local function syncActors()
+	if not actorsMod then
+		local m = ReplicatedStorage:FindFirstChild("Modules")
+		local g = m and m:FindFirstChild("Gameplay")
+		local a = g and g:FindFirstChild("Actors")
+		if a and a:IsA("ModuleScript") then
+			local ok, mod = pcall(require, a)
+			if ok and type(mod) == "table" then actorsMod = mod end
+		end
+	end
+	local list = actorsMod and actorsMod.CurrentActors
+	if type(list) ~= "table" then return end
+	local char = LocalPlayer.Character
+	for _, act in pairs(list) do
+		if type(act) == "table" and (act.Player == LocalPlayer or (char and act.Rig == char)) then
+			if type(act.Config) == "table" then patchCrystal(act.Config.Crystal) end
+			if type(act.State) == "table" then act.State.CrystalFullChargeTime = nil end
+		end
+	end
+end
+
+local function syncStatic()
+	local assets = ReplicatedStorage:FindFirstChild("Assets")
+	if not assets then return end
+	local function patchMod(mod)
+		if not (mod and mod:IsA("ModuleScript")) then return end
+		local ok, cfg = pcall(require, mod)
+		if ok and type(cfg) == "table" then patchCrystal(cfg.Crystal) end
+	end
+	local surv = assets:FindFirstChild("Survivors")
+	local jd = surv and surv:FindFirstChild("JaneDoe")
+	if jd then patchMod(jd:FindFirstChild("Config")) end
+	local skins = assets:FindFirstChild("Skins")
+	local sSurv = skins and skins:FindFirstChild("Survivors")
+	local jdSkins = sSurv and sSurv:FindFirstChild("JaneDoe")
+	if jdSkins then
+		for _, skin in ipairs(jdSkins:GetChildren()) do patchMod(skin:FindFirstChild("Config")) end
+	end
+end
+
+local function restoreAutoRotate()
+	if savedAutoRotate == nil then return end
+	local char = LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then hum.AutoRotate = savedAutoRotate end
+	savedAutoRotate = nil
+end
+
+local function stopHatchet()
+	hatchetUntil = 0
+	if hatchetBound then
+		hatchetBound = false
+		pcall(function() RunService:UnbindFromRenderStep(HATCHET_STEP) end)
+	end
+	restoreAutoRotate()
+end
+
+local function stepHatchet()
+	if unloaded or os.clock() > hatchetUntil then stopHatchet() return end
+	local myRoot, char = localContext()
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (myRoot and hum and hum.Health > 0) then stopHatchet() return end
+
+	local bestRoot, bestDist = nil, HATCHET_RANGE
+	eachKiller(char, function(root)
+		local d = (root.Position - myRoot.Position).Magnitude
+		if d < bestDist then bestRoot, bestDist = root, d end
+	end)
+	if not bestRoot then restoreAutoRotate() return end
+
+	local aimPos = predictPos(bestRoot, math.clamp(bestDist / 45 + getPing() * 0.5, 0.04, 0.25), false)
+	if Vector3.new(aimPos.X - myRoot.Position.X, 0, aimPos.Z - myRoot.Position.Z).Magnitude > 0.05 then
+		if savedAutoRotate == nil then
+			savedAutoRotate = hum.AutoRotate
+			hum.AutoRotate = false
+		end
+		pcall(function() myRoot.AssemblyAngularVelocity = Vector3.zero end)
+		myRoot.CFrame = CFrame.lookAt(myRoot.Position, Vector3.new(aimPos.X, myRoot.Position.Y, aimPos.Z))
+	end
+end
+
+local function bindChar(char)
+	if not char then return end
+	local hum = char:WaitForChild("Humanoid", 5)
+	local anim = hum and (hum:FindFirstChildOfClass("Animator") or hum:WaitForChild("Animator", 5))
+	if not anim then return end
+
+	table.insert(connections, anim.AnimationPlayed:Connect(function(track)
+		if unloaded or not isJaneDoe(char) then return end
+		local a = track and track.Animation
+		local id = a and tostring(a.AnimationId):match("%d+")
+		local name = ((a and a.Name) or (track and track.Name) or ""):lower()
+		if id == "111918351126361" or name:find("axe", 1, true) or name:find("hatchet", 1, true) then
+			hatchetUntil = os.clock() + HATCHET_DUR
+			if not hatchetBound then
+				hatchetBound = true
+				pcall(function() RunService:UnbindFromRenderStep(HATCHET_STEP) end)
+				RunService:BindToRenderStep(HATCHET_STEP, Enum.RenderPriority.Character.Value + 1, stepHatchet)
+			end
+			pcall(function()
+				local c
+				c = track.Stopped:Connect(function()
+					if c then c:Disconnect() end
+					if os.clock() < hatchetUntil then stopHatchet() end
+				end)
+			end)
+			stepHatchet()
+		end
+	end))
+end
+
+table.insert(connections, RunService.Heartbeat:Connect(function()
+	local myRoot, char = localContext()
+	if myRoot then eachKiller(char, sampleTarget) end
+end))
+
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(function(char)
+	stopHatchet()
+	task.delay(0.5, function()
+		if unloaded then return end
+		task.spawn(function() if not crystalOrig then pcall(hookCrystal) end pcall(syncActors) end)
+		task.spawn(bindChar, char)
+	end)
+end))
+
+task.spawn(function()
+	if typeof(getcallbackvalue) ~= "function" then return end
+	local ok, found = pcall(function()
+		return ReplicatedStorage:WaitForChild("Modules", 10)
+			:WaitForChild("Network", 10)
+			:WaitForChild("Network", 10)
+			:WaitForChild("RemoteFunction", 10)
+	end)
+	if not ok or not found or unloaded then return end
+	remote = found
+	local okCb, cur = pcall(getcallbackvalue, remote, "OnClientInvoke")
+	if okCb then origInvoke, remote.OnClientInvoke = cur, invokeHandler end
+end)
+
+task.spawn(function() pcall(hookCrystal) pcall(syncActors) pcall(syncStatic) end)
+if LocalPlayer.Character then task.spawn(bindChar, LocalPlayer.Character) end
+
+env.__JD_UNLOAD = function()
+	if unloaded then return end
+	unloaded = true
+	stopHatchet()
+	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+	table.clear(connections)
+	if remote and origInvoke then pcall(function() remote.OnClientInvoke = origInvoke end) end
+	if hookFn and crystalAbility and crystalOrig then pcall(function() hookFn(crystalAbility.Callback, crystalOrig) end) end
+	env.__JD_UNLOAD = nil
+end
